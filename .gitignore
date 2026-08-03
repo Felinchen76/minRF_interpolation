@@ -1,7 +1,31 @@
-data
-__pycache__
-wandb
-*sample_*
-vae_mds
-ckpt
-flow
+# Existing project-specific outputs from fork
+sample_*
+vae_mds/
+ckpt/
+flow/
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data
+data/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Generated outputs
+contents/*.gif
+contents/*.png
+contents/trajectory_*.pt
+
+# Experiment tracking
+wandb/
