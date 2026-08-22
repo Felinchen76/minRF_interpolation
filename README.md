@@ -1,90 +1,134 @@
-# Minimal Implementation of Scalable Rectified Flow Transformers
+# minRF Interpolation
 
-<p align="center">
-  <img src="contents/51.gif" alt="large" width="300">
-  <img src="contents/51_ln.gif" alt="large" width="300">
-</p>
+This repository started as a fork of the minimal rectified-flow implementation from [minRF](https://github.com/cloneofsimo/minRF). The fork keeps the original compact training logic and DiT-based flow setup, but shifts the focus toward a different research question:
 
-> Left is the naive RF, right is the logit-normal time-sampling RF. Both are trained on MNIST.
+- data-to-data transport between image classes
+- interpolation quality and trajectory structure
+- minimal reusable APIs for experiments in notebooks
+- evaluation logic that distinguishes real flow behavior from endpoint-only shortcuts
 
+The main extension in this fork is a small research API around the original architecture. It is designed for FashionMNIST source-target transport experiments, especially Sneaker → Ankle Boot.
 
-This repository contains a minimal implementation of the rectified flow models. I've taken [SD3](https://arxiv.org/abs/2403.03206) approach of training along with [LLaMA-DiT](https://github.com/Alpha-VLLM/LLaMA2-Accessory) architecture. [Unlike my previous repo](https://github.com/cloneofsimo/minDiffusion) this time I've decided to split the file into 2: The model implementation and actual code, but you don't have to look at the model code.
+## What is new in this fork
 
-Everything is still self-contained, minimal, and hopefully easy to hack. There is nothing complicated goin on if you understood the math.
+- a reusable model and dataset setup in [api/flow_model_api.py](api/flow_model_api.py)
+- a lightweight training wrapper in [api/training_api.py](api/training_api.py)
+- notebook-first evaluation logic for trajectory quality and semantic transitions
+- checkpoint save/load helpers for reproducible experiments
+- notebook-friendly setup functions for local runs and Colab
 
-# 1. *Simple* Rectified Flow, for beginners
+## Current research focus
 
-Install torch, pil, torchvision
+This project is built around a simple but important idea:
 
+- a flow model should not only land near the target distribution
+- it should also move along a semantically meaningful trajectory
+- for data-to-data interpolation, the path structure matters as much as the endpoint
+
+The current setup is centered on FashionMNIST with a source-target pair such as:
+
+- source: Sneaker (7)
+- target: Ankle Boot (9)
+
+The refactored evaluation notebook compares:
+
+- identity baseline
+- global shift baseline
+- linear interpolation oracle
+- NN-matched linear interpolation oracle
+- learned flow trajectory
+
+This makes the project more suitable for research-oriented notebook analysis and for comparing learned transport against simple geometric baselines.
+
+## Project structure
+
+- [dit.py](dit.py): minimal DiT-style transformer backbone
+- [rf.py](rf.py): original rectified-flow training logic
+- [api/flow_model_api.py](api/flow_model_api.py): reusable model, dataset, and checkpoint API
+- [api/training_api.py](api/training_api.py): training wrapper for the data-to-data flow setup
+- [notebooks/05_data_to_data_fm_fashionmnist.ipynb](notebooks/05_data_to_data_fm_fashionmnist.ipynb): training/reference notebook
+- [notebooks/06_evaluation_refined.ipynb](notebooks/06_evaluation_refined.ipynb): refined evaluation notebook
+- [assets/fmnist_d2d_runs](assets/fmnist_d2d_runs): saved checkpoints for the FashionMNIST flow runs
+
+## Minimal usage
+
+The project is intentionally built to be simple in notebooks:
+
+```python
+from api.flow_model_api import prepare_fashionmnist_setup, load_checkpoint
+
+setup = prepare_fashionmnist_setup(model_profile='medium', source_class=7, target_class=9)
+model = setup['model']
+rf_d2d = setup['rf']
+
+ckpt_path = 'assets/fmnist_d2d_runs/fmnist_d2d_checkpoint_best.pt'
+payload = load_checkpoint(model, None, ckpt_path, device)
+rf_d2d.model = model
 ```
-pip install torch torchvision pillow
+
+## Training entry point
+
+Training is kept out of the notebook when the workflow is stable. The reusable training wrapper is in [api/training_api.py](api/training_api.py):
+
+```python
+from api.training_api import TrainingSpec, train_data_to_data_flow
+
+spec = TrainingSpec(
+    model_profile='medium',
+    source_class=7,
+    target_class=9,
+    checkpoint_dir='assets/fmnist_d2d_runs',
+    train_epochs=100,
+    quick_run=False,
+)
+
+result = train_data_to_data_flow(spec=spec, device=device)
+model = result['model']
+rf_d2d = result['rf']
 ```
 
-Run
+This keeps the training loop reproducible and leaves the notebook focused on evaluation, path diagnostics, and interpretation.
 
-```bash
-python rf.py
+## Colab quick start
+
+For Colab, the main thing is to make sure the repository root is on `sys.path` before importing the API modules:
+
+```python
+import sys
+from pathlib import Path
+
+repo_root = Path('/content/minRF_interpolation').resolve()
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from api.flow_model_api import prepare_fashionmnist_setup, load_checkpoint
 ```
 
-to train the model on MNIST from scratch.
+This is usually the cleanest way to keep the repo importable without copying the source files into the notebook itself.
 
-If you are cool and want to train CIFAR instead, you can do that.
+## Notes on the fork
 
-```bash
-python rf.py --cifar
-```
+This repository keeps the original minimal-implementation philosophy from the upstream project, but the actual contribution here is not a large framework rewrite. It is a smaller, research-focused extension:
 
-On 63'th epoch, your output should be something like:
+- keep the model compact
+- keep training logic readable
+- move setup and model logic into reusable API modules
+- keep evaluation notebook-driven because the core research question is path quality and semantic transitions
 
-<p align="center">
-  <img src="contents/cifar_63.gif" alt="large" width="300">
-  <img src="contents/cifar_63.png" alt="large" width="300">
-</p>
+## Credits
 
+This project is a fork of the minimal rectified-flow work by Simo Ryu. The core architecture and initial ideas remain from that codebase, while the data-to-data adaptation, evaluation framing, and API cleanup are the project-specific additions in this fork.
 
-# 2. *Massive* Rectified Flow, muP Support
+## Citation
 
-<p align="center">
-  <img src="advanced/contents/out_IN5.gif" alt="large" width="300">
-</p>
-
-This is for gigachads who wants to train Imagenet instead. Don't worry! IMO Imagenet is the new MNIST, and we will use my [imagenet.int8](https://huggingface.co/datasets/cloneofsimo/imagenet.int8) dataset for this.
-
-First go to advanced dir, download the dataset.
-
-```bash
-cd advanced
-pip install hf_transfer # just do install this.
-bash download.sh
-```
-
-This shouldn't take more than 5 min if your network is decent.
-
-Run
-
-```bash
-bash run.sh
-```
-
-to train the model. This will train Imagenet from scratch, do a muP grid search to find the aligned basin for the loss function, you unlock the zero-shot LR transfer for Rectified Flow models!
-
-
-<p align="center">
-  <img src="advanced/contents/mup.png" alt="large" width="500">
-</p>
-
-This uses multiple techniques and codebases I have developed over the year. Its a natural mixture of [min-max-IN-dit](https://github.com/cloneofsimo/min-max-in-dit), [min-max-gpt](https://github.com/cloneofsimo/min-max-gpt), [ez-muP](https://github.com/cloneofsimo/ezmup)
-
-# Citations
-
-If you use this material, please cite this repository with the following:
+If you use this repo in its forked or adapted form, please cite the upstream project and also refer to this fork as a custom research extension.
 
 ```bibtex
 @misc{ryu2024minrf,
   author       = {Simo Ryu},
   title        = {minRF: Minimal Implementation of Scalable Rectified Flow Transformers},
   year         = 2024,
-  publisher    = {Github},
-  url          = {https://github.com/cloneofsimo/minRF},
+  publisher    = {GitHub},
+  url          = {https://github.com/cloneofsimo/minRF}
 }
 ```
