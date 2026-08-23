@@ -16,9 +16,12 @@ support multiple experimental phases with minimal code duplication
 import json
 import numpy as np
 import torch
+import torch.nn as nn
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
 
 
 # small preset table for FashionMNIST class labels
@@ -35,7 +38,66 @@ def format_pair_name(source: int, target: int) -> str:
     return f"{FMNIST_CLASS_NAMES[source]}({source}) → {FMNIST_CLASS_NAMES[target]}({target})"
 
 
-# core evaluator for flow models
+# standard small CNN used as external classifier for trajectory evaluation
+# shared architecture across all phases for consistent comparison
+def build_eval_classifier() -> nn.Sequential:
+    return nn.Sequential(
+        nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(),
+        nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+        nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+        nn.Flatten(),
+        nn.Linear(128 * 8 * 8, 128), nn.ReLU(),
+        nn.Linear(128, 10),
+    )
+
+
+def train_eval_classifier(
+    device: torch.device,
+    data_root: str = "data",
+    epochs: int = 5,
+    save_path: Optional[str] = None,
+) -> nn.Sequential:
+    """train the shared eval classifier on full FashionMNIST
+    returns a trained model ready for evaluation use"""
+    transform = transforms.Compose([
+        transforms.Pad(2),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,)),
+    ])
+    train_ds = datasets.FashionMNIST(data_root, train=True, download=True, transform=transform)
+    loader = DataLoader(train_ds, batch_size=256, shuffle=True, num_workers=2)
+
+    model = build_eval_classifier().to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    model.train()
+    for epoch in range(epochs):
+        total, correct = 0, 0
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad()
+            loss = nn.functional.cross_entropy(model(x), y)
+            loss.backward()
+            opt.step()
+            correct += (model(x).argmax(1) == y).sum().item()
+            total += len(y)
+        print(f"  Classifier epoch {epoch + 1}/{epochs} — acc: {correct / total:.3f}")
+
+    model.eval()
+
+    if save_path is not None:
+        torch.save(model.state_dict(), save_path)
+        print(f"  ok Classifier saved: {save_path}")
+
+    return model
+
+
+def load_eval_classifier(path: str, device: torch.device) -> nn.Sequential:
+    """load a previously trained eval classifier"""
+    model = build_eval_classifier().to(device)
+    model.load_state_dict(torch.load(path, map_location=device))
+    model.eval()
+    return model
 # computes trajectory metrics and aggregates over random samples
 class FlowEvaluator:
     def __init__(self, eval_model, test_dataset, test_label_index, device):
@@ -189,4 +251,4 @@ class ResultsCollector:
     def print_summary(self, metrics_to_show: List[str] | None = None):
         """print a formatted summary table to stdout"""
         print(self.to_table_string(metrics_to_show))
-        print(f"\n✓ Results saved to {self.output_dir}")
+        print(f"\nok Results saved to {self.output_dir}")
