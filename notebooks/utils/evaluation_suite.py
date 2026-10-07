@@ -76,10 +76,11 @@ def train_eval_classifier(
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             opt.zero_grad()
-            loss = nn.functional.cross_entropy(model(x), y)
+            logits = model(x)
+            loss = nn.functional.cross_entropy(logits, y)
             loss.backward()
             opt.step()
-            correct += (model(x).argmax(1) == y).sum().item()
+            correct += (logits.argmax(1) == y).sum().item()
             total += len(y)
         print(f"  Classifier epoch {epoch + 1}/{epochs} — acc: {correct / total:.3f}")
 
@@ -98,6 +99,141 @@ def load_eval_classifier(path: str, device: torch.device) -> nn.Sequential:
     model.load_state_dict(torch.load(path, map_location=device))
     model.eval()
     return model
+
+
+@torch.no_grad()
+def linear_interpolation(x_a: torch.Tensor, x_b: torch.Tensor, steps: int = 50) -> List[torch.Tensor]:
+    """Return list of `steps+1` tensors interpolating between x_a and x_b
+    Accepts tensors of shape (1,C,H,W) or (C,H,W)
+    """
+    if x_a.ndim == 3:
+        x_a = x_a.unsqueeze(0)
+    if x_b.ndim == 3:
+        x_b = x_b.unsqueeze(0)
+    return [((1.0 - i / max(1, steps)) * x_a + (i / max(1, steps)) * x_b).clone() for i in range(steps + 1)]
+
+
+@torch.no_grad()
+def identity_trajectory(x_a: torch.Tensor, steps: int = 50) -> List[torch.Tensor]:
+    """Return constant trajectory (no transport)"""
+    return [x_a.clone() for _ in range(steps + 1)]
+
+
+@torch.no_grad()
+def build_class_mean(dataset, label: int, label_index: Dict[int, List[int]]):
+    """Compute mean image for a class using provided label index (list of indices per class)"""
+    idxs = label_index[int(label)]
+    xs = []
+    for idx in idxs:
+        x, _ = dataset[idx]
+        xs.append(x.unsqueeze(0))
+    return torch.cat(xs, dim=0).mean(dim=0, keepdim=True)
+
+
+@torch.no_grad()
+def global_shift_trajectory(x_a: torch.Tensor, source_mean: torch.Tensor, target_mean: torch.Tensor, steps: int = 50) -> List[torch.Tensor]:
+    """Shift the sample towards the difference of class means (per-step fraction of delta)"""
+    delta = target_mean - source_mean
+    return [(x_a + (i / max(1, steps)) * delta).clone() for i in range(steps + 1)]
+
+
+@torch.no_grad()
+def nn_matched_linear_trajectory(x_a: torch.Tensor, target_label: int, dataset, label_index: Dict[int, List[int]], steps: int = 50, max_items: int = 2000):
+    """Find a nearest neighbour target in pixel space and run linear interpolation towards it
+    Uses a flattened L2 distance via `torch.cdist` over a subset of target class examples
+    """
+    idxs = label_index[int(target_label)]
+    bank = []
+    for idx in idxs[:max_items]:
+        x, _ = dataset[idx]
+        bank.append(x.unsqueeze(0))
+    bank = torch.cat(bank, dim=0)
+    x_flat = x_a.view(1, -1)
+    bank_flat = bank.view(bank.shape[0], -1)
+    d = torch.cdist(x_flat, bank_flat, p=2)
+    nn_idx = int(torch.argmin(d).item())
+    x_b_nn = bank[nn_idx].unsqueeze(0)
+    return linear_interpolation(x_a, x_b_nn, steps=steps)
+
+
+@torch.no_grad()
+def evaluate_baseline_set(flow_model, eval_model, test_dataset, test_label_index: Dict[int, List[int]], source_label: int, target_label: int, n_pairs: int = 30, steps: int = 50) -> Dict[str, Any]:
+    """Compute aggregate baseline metrics for a class pair
+
+    Parameters:
+    - flow_model: may be None (flow trajectories skipped) or an object with `.sample(x, steps=...)`
+    - eval_model: classifier for computing confidences (on-device should be handled by caller)
+    - test_dataset, test_label_index: dataset and index mapping used to draw samples and class banks
+    - source_label, target_label: integers of classes
+    - n_pairs, steps: evaluation config
+
+    Returns dict with same metric keys as `FlowEvaluator.evaluate_classepair` plus per‑baseline aggregates
+    """
+    summary = {name: {'endpoint_acc': [], 'endpoint_conf': [], 'mean_target_conf': [], 'max_target_conf': [], 'monotonicity': []} for name in ['identity', 'global_shift', 'linear_oracle', 'nn_linear_oracle', 'flow']}
+
+    source_mean = build_class_mean(test_dataset, source_label, test_label_index)
+    target_mean = build_class_mean(test_dataset, target_label, test_label_index)
+
+    for _ in range(n_pairs):
+        idx_a = int(np.random.choice(test_label_index[int(source_label)]))
+        idx_b = int(np.random.choice(test_label_index[int(target_label)]))
+
+        x_a, _ = test_dataset[idx_a]
+        x_b, _ = test_dataset[idx_b]
+        x_a = x_a.unsqueeze(0)
+        x_b = x_b.unsqueeze(0)
+
+        identities = identity_trajectory(x_a, steps)
+        shifts = global_shift_trajectory(x_a, source_mean, target_mean, steps)
+        linear_traj = linear_interpolation(x_a, x_b, steps)
+        nn_linear_traj = nn_matched_linear_trajectory(x_a, target_label, test_dataset, test_label_index, steps=steps)
+
+        flow_traj = []
+        if flow_model is not None:
+            try:
+                flow_traj = flow_model.sample(x_a, steps=steps)
+            except Exception:
+                flow_traj = []
+
+        def summarize_trajectory(trajectory, target_label_local):
+            probs = []
+            # ensure trajectory tensors are on the same device as eval_model
+            try:
+                model_dev = next(eval_model.parameters()).device
+            except Exception:
+                model_dev = torch.device('cpu')
+            for z in trajectory:
+                p = torch.softmax(eval_model(z.to(model_dev)), dim=1)[0].detach().cpu()
+                probs.append(p)
+            probs = torch.stack(probs, dim=0)
+            target_conf = probs[:, target_label_local]
+            endpoint_pred = int(torch.argmax(probs[-1]).item())
+            return {
+                'endpoint_acc': float(endpoint_pred == target_label_local),
+                'endpoint_conf': float(target_conf[-1].item()),
+                'mean_target_conf': float(target_conf.mean().item()),
+                'max_target_conf': float(target_conf.max().item()),
+                'monotonicity': float((target_conf[1:] - target_conf[:-1] > 0).float().mean().item()),
+            }
+
+        for name, traj in [('identity', identities), ('global_shift', shifts), ('linear_oracle', linear_traj), ('nn_linear_oracle', nn_linear_traj), ('flow', flow_traj)]:
+            if not traj:
+                # skip empty flow trajectories
+                continue
+            metrics = summarize_trajectory(traj, int(target_label))
+            for key in ['endpoint_acc', 'endpoint_conf', 'mean_target_conf', 'max_target_conf', 'monotonicity']:
+                summary[name][key].append(metrics[key])
+
+    # aggregate
+    aggregated = {}
+    for name, metrics in summary.items():
+        if all(len(v) == 0 for v in metrics.values()):
+            # no data for this method
+            aggregated[name] = {k: float('nan') for k in ['endpoint_acc', 'endpoint_conf', 'mean_target_conf', 'max_target_conf', 'monotonicity']}
+            continue
+        aggregated[name] = {k: float(np.mean(v)) for k, v in metrics.items()}
+
+    return aggregated
 # computes trajectory metrics and aggregates over random samples
 class FlowEvaluator:
     def __init__(self, eval_model, test_dataset, test_label_index, device):
@@ -107,7 +243,7 @@ class FlowEvaluator:
         self.device = device
 
     @torch.no_grad()
-    def compute_monotonicity(self, trajectory: torch.Tensor, target_label: int) -> float:
+    def compute_monotonicity(self, trajectory: list, target_label: int) -> float:
         """compute % of steps where target class confidence increases"""
         probs = []
         for z in trajectory:
