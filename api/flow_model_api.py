@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 
 from dit import DiT_Llama
@@ -54,6 +54,8 @@ class DatasetSpec:
     channels: int = 1
     source_class: int = 7
     target_class: int = 9
+    validation_fraction: float = 0.1
+    split_seed: int = 42
     class_names: Dict[int, str] = field(default_factory=lambda: DEFAULT_FASHIONMNIST_CLASS_NAMES.copy())
     batch_size: int = 128
     test_batch_size: int = 128
@@ -187,13 +189,20 @@ class DataToDataRF:
 
 
 def build_transform(image_size: int = 32):
-    return transforms.Compose(
-        [
-            transforms.ToTensor(),
-            transforms.Pad((32 - 28) // 2),
-            transforms.Normalize((0.5,), (0.5,)),
-        ]
-    )
+    if image_size < 1:
+        raise ValueError("image_size must be a positive integer")
+
+    image_transforms = [transforms.ToTensor()]
+    if image_size >= 28:
+        padding = image_size - 28
+        left = top = padding // 2
+        right = bottom = padding - padding // 2
+        if padding:
+            image_transforms.append(transforms.Pad((left, top, right, bottom)))
+    else:
+        image_transforms.append(transforms.Resize((image_size, image_size)))
+    image_transforms.append(transforms.Normalize((0.5,), (0.5,)))
+    return transforms.Compose(image_transforms)
 
 
 # tiny factory for datasets and dataloaders
@@ -204,6 +213,8 @@ def build_dataset_loaders(
     test_batch_size: Optional[int] = None,
     download: bool = True,
 ):
+    if not 0.0 < spec.validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be between 0 and 1")
     batch_size = batch_size if batch_size is not None else spec.batch_size
     test_batch_size = test_batch_size if test_batch_size is not None else spec.test_batch_size
 
@@ -239,8 +250,33 @@ def build_dataset_loaders(
     else:
         raise ValueError(f"Unsupported dataset: {spec.name}")
 
+    labels = train_dataset.targets.tolist()
+    indices_by_label = {label: [] for label in range(10)}
+    for idx, label in enumerate(labels):
+        indices_by_label[int(label)].append(idx)
+
+    generator = torch.Generator().manual_seed(spec.split_seed)
+    train_indices = []
+    validation_indices = []
+    for label_indices in indices_by_label.values():
+        permutation = torch.randperm(len(label_indices), generator=generator).tolist()
+        shuffled_indices = [label_indices[index] for index in permutation]
+        validation_count = max(1, round(len(shuffled_indices) * spec.validation_fraction))
+        if len(shuffled_indices) < 2:
+            validation_count = 0
+        validation_indices.extend(shuffled_indices[:validation_count])
+        train_indices.extend(shuffled_indices[validation_count:])
+
+    train_split = Subset(train_dataset, train_indices)
+    validation_split = Subset(train_dataset, validation_indices)
     train_pair_dataset = PairFashionMNISTDataset(
-        train_dataset,
+        train_split,
+        source_class=spec.source_class,
+        target_class=spec.target_class,
+        pairing_mode="random",
+    )
+    validation_pair_dataset = PairFashionMNISTDataset(
+        validation_split,
         source_class=spec.source_class,
         target_class=spec.target_class,
         pairing_mode="random",
@@ -253,6 +289,12 @@ def build_dataset_loaders(
     )
 
     train_loader = DataLoader(train_pair_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    validation_loader = DataLoader(
+        validation_pair_dataset,
+        batch_size=test_batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
     test_loader = DataLoader(test_pair_dataset, batch_size=test_batch_size, shuffle=False, drop_last=False)
 
     train_label_index = {i: [] for i in range(10)}
@@ -265,8 +307,10 @@ def build_dataset_loaders(
 
     return {
         "train_dataset": train_dataset,
+        "validation_dataset": validation_split,
         "test_dataset": test_dataset,
         "train_loader": train_loader,
+        "validation_loader": validation_loader,
         "test_loader": test_loader,
         "train_label_index": train_label_index,
         "test_label_index": test_label_index,
@@ -378,6 +422,8 @@ def prepare_fashionmnist_setup(
     train_epochs: int = 100,
     quick_run: bool = False,
     lr: float = 2e-4,
+    validation_fraction: float = 0.1,
+    split_seed: int = 42,
 ):
     spec = DatasetSpec(
         name="fashionmnist",
@@ -386,6 +432,8 @@ def prepare_fashionmnist_setup(
         channels=1,
         source_class=source_class,
         target_class=target_class,
+        validation_fraction=validation_fraction,
+        split_seed=split_seed,
         class_names=DEFAULT_FASHIONMNIST_CLASS_NAMES.copy(),
         batch_size=batch_size,
         test_batch_size=test_batch_size,
@@ -412,6 +460,7 @@ def prepare_fashionmnist_setup(
         "dataset_spec": spec,
         "model_spec": model_spec,
         "train_loader": loaders["train_loader"],
+        "validation_loader": loaders["validation_loader"],
         "test_loader": loaders["test_loader"],
         "train_dataset": loaders["train_dataset"],
         "test_dataset": loaders["test_dataset"],

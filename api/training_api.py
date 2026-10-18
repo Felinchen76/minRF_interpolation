@@ -49,6 +49,8 @@ class TrainingSpec:
     checkpoint_every: int = 20
     resume_from: Optional[str] = None
     mixed_precision: bool = False
+    validation_fraction: float = 0.1
+    split_seed: int = 42
 
     def __post_init__(self):
         if self.checkpoint_every < 1:
@@ -93,8 +95,9 @@ def evaluate_epoch_loss(
                 enabled=mixed_precision and device.type == "cuda",
             ):
                 loss = model_rf.forward(x_a, x_b)
-            total += loss.item()
-            count += 1
+            batch_size = x_a.size(0)
+            total += loss.item() * batch_size
+            count += batch_size
 
     return total / max(1, count)
 
@@ -122,6 +125,8 @@ def train_data_to_data_flow(
         root=spec.root,
         batch_size=spec.batch_size,
         test_batch_size=spec.test_batch_size,
+        validation_fraction=spec.validation_fraction,
+        split_seed=spec.split_seed,
         checkpoint_dir=spec.checkpoint_dir,
         train_epochs=spec.train_epochs,
         quick_run=spec.quick_run,
@@ -133,6 +138,7 @@ def train_data_to_data_flow(
     rf.model = model
     optimizer = setup["optimizer"]
     train_loader = setup["train_loader"]
+    validation_loader = setup["validation_loader"]
     test_loader = setup["test_loader"]
 
     run_paths = checkpoint_paths(spec.checkpoint_dir, spec.model_name)
@@ -164,7 +170,17 @@ def train_data_to_data_flow(
                 "This checkpoint has no complete resume state. Use a checkpoint created "
                 "by the updated training API; legacy weights can only be loaded for evaluation."
             )
-        for key in ("source_class", "target_class", "model_profile", "batch_size", "mixed_precision"):
+        for key in (
+            "source_class",
+            "target_class",
+            "model_profile",
+            "batch_size",
+            "test_batch_size",
+            "lr",
+            "mixed_precision",
+            "validation_fraction",
+            "split_seed",
+        ):
             if payload["config"].get(key) != config[key]:
                 raise ValueError(f"Resume configuration differs for {key}")
         train_loss_history = list(payload["train_history"])
@@ -199,7 +215,8 @@ def train_data_to_data_flow(
         print(
             f"Training on {device}"
             f" ({torch.cuda.get_device_name(device) if device.type == 'cuda' else 'CPU'})"
-            f" | AMP: {amp_enabled} | batches: {len(train_loader)} train, {len(test_loader)} val"
+            f" | AMP: {amp_enabled} | batches: {len(train_loader)} train,"
+            f" {len(validation_loader)} val"
         )
         if spec.mixed_precision and not amp_enabled:
             print("CUDA AMP requested but unavailable on this device; using FP32.")
@@ -235,7 +252,8 @@ def train_data_to_data_flow(
             train_seconds = perf_counter() - epoch_start
             val_start = perf_counter()
             val_epoch_loss = evaluate_epoch_loss(
-                rf, test_loader, device, max_batches=eval_batches, mixed_precision=amp_enabled
+                rf, validation_loader, device,
+                max_batches=eval_batches, mixed_precision=amp_enabled
             )
             val_seconds = perf_counter() - val_start
 
@@ -300,6 +318,7 @@ def train_data_to_data_flow(
         "optimizer": optimizer,
         "train_loader": train_loader,
         "test_loader": test_loader,
+        "validation_loader": validation_loader,
         "train_history": train_loss_history,
         "val_history": val_loss_history,
         "loss_history": loss_history,
