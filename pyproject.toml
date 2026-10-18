@@ -1,0 +1,116 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "minrf-interpolation"
+version = "0.1.0"
+description = "Minimal Rectified Flow for semantically meaningful image interpolation"
+readme = "FORK_README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Original minRF authors"},
+    {name = "Fork maintainer"}
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "numpy>=1.24.0",
+    "pillow>=10.0.0",
+    "scipy>=1.11.0",
+    "matplotlib>=3.8.0",
+    "imageio>=2.33.0",
+    "tqdm>=4.66.0",
+    "einops>=0.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.9.0",
+    "isort>=5.12.0",
+    "ruff>=0.0.292",
+]
+notebook = [
+    "jupyter>=1.0.0",
+    "jupyterlab>=4.0.0",
+    "ipython>=8.15.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Felinchen76/minRF_interpolation"
+Repository = "https://github.com/Felinchen76/minRF_interpolation"
+Documentation = "https://github.com/Felinchen76/minRF_interpolation/blob/main/FORK_README.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["api"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.venv
+  | \.uv
+  | build
+  | dist
+  | notebooks
+  | notebook_archive
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_mode = 3
+line_length = 100
+skip_glob = ["*/migrations/*", "notebooks/*", "notebook_archive/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = [
+    "notebooks",
+    "notebook_archive",
+    ".venv",
+    ".uv",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "C",      # flake8-comprehensions
+    "B",      # flake8-bugbear
+]
+ignore = [
+    "E501",   # line-too-long (handled by black)
+    "W191",   # indentation-contains-tabs
+    "B008",   # function-call-in-default-argument
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "--cov=api --cov-report=term-short"
+
+[tool.coverage.run]
+source = ["api"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]

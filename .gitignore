@@ -1,31 +1,87 @@
-# Existing project-specific outputs from fork
-sample_*
-vae_mds/
-ckpt/
-flow/
+# ============================================================================
+# MINRF_INTERPOLATION .GITIGNORE
+# ============================================================================
+# Keep code, notebooks, and documentation
+# Ignore: data, checkpoints, outputs, environments, caches
+
+# Virtual Environment
+.venv/
+.env
+venv/
+env/
 
 # Python
 __pycache__/
-*.pyc
-
-# Virtual environment
-.venv/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # Jupyter
 .ipynb_checkpoints/
+.jupyter/
 
-# Data
-data/
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-# Model checkpoints
+# OS
+.DS_Store
+Thumbs.db
+
+# ============================================================================
+# PROJECT-SPECIFIC: CHECKPOINTS & DATA (DO NOT COMMIT)
+# ============================================================================
+
+# Large model files (checkpoints)
 *.pt
 *.pth
 *.ckpt
 
-# Generated outputs
-contents/*.gif
-contents/*.png
-contents/trajectory_*.pt
+# Data (downloaded at runtime)
+data/
+datasets/
+
+# Assets & Results (training outputs)
+assets/
+checkpoints/
+checkpoints_old/
+results/
+
+# Outputs from notebooks
+*.gif
+*.png
+output.png
+contents/
+outputs/
 
 # Experiment tracking
 wandb/
+lightning_logs/
+
+# Archive (old checkpoints, outputs, etc.)
+notebook_archive/*
+# ============================================================================
+# ORIGINAL FORK FILES (keep these for reference)
+# ============================================================================
+# README.md - Original fork docs
+# FORK_README.md - Fork extensions
+# (These are NOT ignored - they are tracked)
