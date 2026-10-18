@@ -165,21 +165,28 @@ class CheckpointManager:
         Returns:
             Path to saved checkpoint
         """
+        direct_path = Path(run_name)
+        is_direct_path = direct_path.suffix == ".pt"
         checkpoint_path = (
-            self.get_periodic_checkpoint_path(run_name, epoch)
-            if epoch is not None
-            else self.get_checkpoint_path(run_name, checkpoint_type)
+            direct_path
+            if is_direct_path
+            else (
+                self.get_periodic_checkpoint_path(run_name, epoch)
+                if epoch is not None
+                else self.get_checkpoint_path(run_name, checkpoint_type)
+            )
         )
-        metadata_path = self.get_metadata_path(run_name)
+        metadata_path = (
+            checkpoint_path.with_name(f"{checkpoint_path.stem}_metadata.json")
+            if is_direct_path
+            else self.get_metadata_path(run_name)
+        )
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
         train_history = train_history or []
         val_history = val_history or []
         extra = extra or {}
-        if metadata is None:
-            if config is None or not extra or not train_history:
-                raise ValueError(
-                    "metadata is required unless config, training histories, and extra state are provided"
-                )
+        if metadata is None and config is not None and extra and train_history:
             metadata = CheckpointMetadata(
                 model_profile=str(config["model_profile"]),
                 source_class=int(config["source_class"]),
@@ -197,7 +204,7 @@ class CheckpointManager:
 
         checkpoint_data = {
             'model_state_dict': model.state_dict(),
-            'metadata': metadata.to_dict(),
+            'metadata': metadata.to_dict() if metadata is not None else None,
         }
         if optimizer is not None:
             checkpoint_data['optimizer_state_dict'] = optimizer.state_dict()
@@ -221,7 +228,8 @@ class CheckpointManager:
         finally:
             temporary_path.unlink(missing_ok=True)
 
-        metadata.save(metadata_path)
+        if metadata is not None:
+            metadata.save(metadata_path)
         return checkpoint_path
     
     def load_checkpoint(

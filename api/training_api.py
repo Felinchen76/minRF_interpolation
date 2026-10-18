@@ -12,11 +12,14 @@ keep checkpoint handling reproducible
 keep notebook logic focused on analysis and interpretation
 """
 
+import os
+import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
+import numpy as np
 import torch
 
 from api.checkpoint_management import CheckpointManager
@@ -49,9 +52,12 @@ class TrainingSpec:
     resume_from: Optional[str] = None
     mixed_precision: bool = False
     validation_fraction: float = 0.1
-    split_seed: int = 42
+    seed: int = 42
+    deterministic: bool = True
 
     def __post_init__(self):
+        if self.seed < 0:
+            raise ValueError("seed must be non-negative")
         if self.checkpoint_every < 1:
             raise ValueError("checkpoint_every must be at least 1")
         if self.train_epochs < 1:
@@ -100,6 +106,84 @@ def evaluate_epoch_loss(
     return total / max(1, count)
 
 
+def seed_everything(seed: int, deterministic: bool = True) -> None:
+    if deterministic and os.environ.get("CUBLAS_WORKSPACE_CONFIG") not in {":4096:8", ":16:8"}:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.use_deterministic_algorithms(deterministic)
+
+
+def _capture_rng_state(loaders: Dict[str, Any]) -> Dict[str, Any]:
+    numpy_name, numpy_values, numpy_position, numpy_has_gauss, numpy_cached_gaussian = (
+        np.random.get_state()
+    )
+    loader_states = {}
+    for name, loader in loaders.items():
+        dataset = getattr(loader, "dataset", None)
+        generator = getattr(loader, "generator", None)
+        loader_states[name] = {
+            "generator": generator.get_state() if generator is not None else None,
+            "dataset": (
+                dataset.get_rng_state()
+                if dataset is not None and hasattr(dataset, "get_rng_state")
+                else None
+            ),
+        }
+
+    return {
+        "python": random.getstate(),
+        "numpy": {
+            "name": numpy_name,
+            "values": numpy_values.tolist(),
+            "position": numpy_position,
+            "has_gauss": numpy_has_gauss,
+            "cached_gaussian": numpy_cached_gaussian,
+        },
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        "loaders": loader_states,
+    }
+
+
+def _restore_rng_state(state: Dict[str, Any], loaders: Dict[str, Any]) -> None:
+    random.setstate(state["python"])
+    numpy_state = state["numpy"]
+    np.random.set_state(
+        (
+            numpy_state["name"],
+            np.asarray(numpy_state["values"], dtype=np.uint32),
+            numpy_state["position"],
+            numpy_state["has_gauss"],
+            numpy_state["cached_gaussian"],
+        )
+    )
+    torch.set_rng_state(state["torch"])
+    cuda_states = state["cuda"]
+    if cuda_states and torch.cuda.is_available():
+        if len(cuda_states) != torch.cuda.device_count():
+            raise ValueError(
+                "Cannot exactly resume: checkpoint and current run use different "
+                "numbers of CUDA devices."
+            )
+        torch.cuda.set_rng_state_all(cuda_states)
+
+    loader_states = state["loaders"]
+    for name, loader in loaders.items():
+        saved_state = loader_states[name]
+        generator = getattr(loader, "generator", None)
+        dataset = getattr(loader, "dataset", None)
+        if saved_state["generator"] is not None and generator is not None:
+            generator.set_state(saved_state["generator"])
+        if saved_state["dataset"] is not None and dataset is not None:
+            dataset.set_rng_state(saved_state["dataset"])
+
+
 # main training entry point for the research-style data-to-data flow setup
 # notebooks can call this once and then focus on evaluation and interpretation
 def train_data_to_data_flow(
@@ -116,6 +200,8 @@ def train_data_to_data_flow(
     if spec.resume_from is not None and not Path(spec.resume_from).is_file():
         raise FileNotFoundError(f"Checkpoint not found: {spec.resume_from}")
 
+    seed_everything(spec.seed, spec.deterministic)
+
     setup = prepare_fashionmnist_setup(
         model_profile=spec.model_profile,
         source_class=spec.source_class,
@@ -124,7 +210,7 @@ def train_data_to_data_flow(
         batch_size=spec.batch_size,
         test_batch_size=spec.test_batch_size,
         validation_fraction=spec.validation_fraction,
-        split_seed=spec.split_seed,
+        seed=spec.seed,
         checkpoint_dir=spec.checkpoint_dir,
         train_epochs=spec.train_epochs,
         quick_run=spec.quick_run,
@@ -171,6 +257,7 @@ def train_data_to_data_flow(
                 "This checkpoint has no complete resume state. Use a checkpoint created "
                 "by the updated training API; legacy weights can only be loaded for evaluation."
             )
+        saved_config = payload.get("config", {})
         for key in (
             "source_class",
             "target_class",
@@ -180,9 +267,15 @@ def train_data_to_data_flow(
             "lr",
             "mixed_precision",
             "validation_fraction",
-            "split_seed",
+            "seed",
+            "deterministic",
         ):
-            if payload["config"].get(key) != config[key]:
+            saved_value = saved_config.get(key)
+            if key == "seed" and saved_value is None:
+                saved_value = saved_config.get("split_seed", 42)
+            elif key == "deterministic" and saved_value is None:
+                saved_value = config[key]
+            if saved_value != config[key]:
                 raise ValueError(f"Resume configuration differs for {key}")
         train_loss_history = list(payload["train_history"])
         val_loss_history = list(payload["val_history"])
@@ -194,6 +287,17 @@ def train_data_to_data_flow(
         best_epoch = state["best_epoch"]
         epochs_no_improve = state["epochs_no_improve"]
         scaler.load_state_dict(state["scaler"])
+        if "rng_state" in state:
+            _restore_rng_state(
+                state["rng_state"],
+                {
+                    "train": train_loader,
+                    "validation": validation_loader,
+                    "test": test_loader,
+                },
+            )
+        else:
+            print("warning: checkpoint has no RNG state; resumed run will not be exact")
         print(f"resuming from {spec.resume_from} after epoch {start_epoch}")
 
     if (spec.resume_from is None and not spec.force_retrain
@@ -279,6 +383,13 @@ def train_data_to_data_flow(
                 "best_epoch": best_epoch,
                 "epochs_no_improve": epochs_no_improve,
                 "scaler": scaler.state_dict(),
+                "rng_state": _capture_rng_state(
+                    {
+                        "train": train_loader,
+                        "validation": validation_loader,
+                        "test": test_loader,
+                    }
+                ),
             }
             save_start = perf_counter()
             checkpoint_manager.save_checkpoint(
@@ -354,5 +465,6 @@ __all__ = [
     "TrainingSpec",
     "checkpoint_paths",
     "evaluate_epoch_loss",
+    "seed_everything",
     "train_data_to_data_flow",
 ]

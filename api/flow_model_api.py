@@ -12,10 +12,7 @@ expose a tiny API for setup, checkpointing, and evaluation
 stay lightweight enough for notebooks and quick experiments
 """
 
-import json
-import os
 import random
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -26,6 +23,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 
+from api.checkpoint_management import CheckpointManager
 from dit import DiT_Llama
 
 
@@ -55,7 +53,7 @@ class DatasetSpec:
     source_class: int = 7
     target_class: int = 9
     validation_fraction: float = 0.1
-    split_seed: int = 42
+    seed: int = 42
     class_names: Dict[int, str] = field(default_factory=lambda: DEFAULT_FASHIONMNIST_CLASS_NAMES.copy())
     batch_size: int = 128
     test_batch_size: int = 128
@@ -110,18 +108,22 @@ class PairFashionMNISTDataset(Dataset):
         source_class: int,
         target_class: int,
         pairing_mode: str = "random",
-        seed: Optional[int] = None,
+        seed: int = 42,
     ):
         self.dataset = dataset
         self.source_class = int(source_class)
         self.target_class = int(target_class)
         self.pairing_mode = pairing_mode
 
+        if isinstance(self.dataset, Subset):
+            targets = self.dataset.dataset.targets[self.dataset.indices]
+        else:
+            targets = self.dataset.targets
         self.label_index = {i: [] for i in range(10)}
-        for idx, (_, y) in enumerate(self.dataset):
-            self.label_index[int(y)].append(idx)
+        for idx, label in enumerate(targets):
+            self.label_index[int(label)].append(idx)
 
-        self.rng = random.Random(seed if seed is not None else 42)
+        self.rng = random.Random(seed)
 
     def __len__(self):
         return max(len(self.label_index[self.source_class]), len(self.label_index[self.target_class]))
@@ -133,6 +135,12 @@ class PairFashionMNISTDataset(Dataset):
         x_a, _ = self.dataset[idx_a]
         x_b, _ = self.dataset[idx_b]
         return x_a, x_b
+
+    def get_rng_state(self):
+        return self.rng.getstate()
+
+    def set_rng_state(self, state):
+        self.rng.setstate(state)
 
 
 # core flow wrapper
@@ -255,7 +263,7 @@ def build_dataset_loaders(
     for idx, label in enumerate(labels):
         indices_by_label[int(label)].append(idx)
 
-    generator = torch.Generator().manual_seed(spec.split_seed)
+    generator = torch.Generator().manual_seed(spec.seed)
     train_indices = []
     validation_indices = []
     for label_indices in indices_by_label.values():
@@ -274,36 +282,52 @@ def build_dataset_loaders(
         source_class=spec.source_class,
         target_class=spec.target_class,
         pairing_mode="random",
+        seed=spec.seed,
     )
     validation_pair_dataset = PairFashionMNISTDataset(
         validation_split,
         source_class=spec.source_class,
         target_class=spec.target_class,
         pairing_mode="random",
+        seed=spec.seed + 1,
     )
     test_pair_dataset = PairFashionMNISTDataset(
         test_dataset,
         source_class=spec.source_class,
         target_class=spec.target_class,
         pairing_mode="random",
+        seed=spec.seed + 2,
     )
 
-    train_loader = DataLoader(train_pair_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    train_loader = DataLoader(
+        train_pair_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        generator=torch.Generator().manual_seed(spec.seed + 3),
+    )
     validation_loader = DataLoader(
         validation_pair_dataset,
         batch_size=test_batch_size,
         shuffle=False,
         drop_last=False,
+        generator=torch.Generator().manual_seed(spec.seed + 4),
     )
-    test_loader = DataLoader(test_pair_dataset, batch_size=test_batch_size, shuffle=False, drop_last=False)
+    test_loader = DataLoader(
+        test_pair_dataset,
+        batch_size=test_batch_size,
+        shuffle=False,
+        drop_last=False,
+        generator=torch.Generator().manual_seed(spec.seed + 5),
+    )
 
     train_label_index = {i: [] for i in range(10)}
-    for idx, (_, y) in enumerate(train_dataset):
-        train_label_index[int(y)].append(idx)
+    for idx, label in enumerate(train_dataset.targets):
+        train_label_index[int(label)].append(idx)
 
     test_label_index = {i: [] for i in range(10)}
-    for idx, (_, y) in enumerate(test_dataset):
-        test_label_index[int(y)].append(idx)
+    for idx, label in enumerate(test_dataset.targets):
+        test_label_index[int(label)].append(idx)
 
     return {
         "train_dataset": train_dataset,
@@ -332,14 +356,7 @@ def build_flow_model(spec: ModelSpec):
     return model, rf, optimizer
 
 
-# small helper for predictable checkpoint names
-def checkpoint_path_for_run(run_dir: str | Path, profile: str, pairing_mode: str, suffix: str) -> Path:
-    run_dir = Path(run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir / f"{suffix}_{profile}_{pairing_mode}.pt"
-
-
-# save a full training snapshot for reproducible runs
+# Compatibility helpers; CheckpointManager owns checkpoint serialization.
 def save_checkpoint(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -350,62 +367,28 @@ def save_checkpoint(
     extra: Optional[Dict[str, Any]] = None,
 ):
     checkpoint_path = Path(checkpoint_path)
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
-    payload = {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "config": config,
-        "train_history": train_history or [],
-        "val_history": val_history or [],
-        "extra": extra or {},
-    }
-    # Keep the previous snapshot intact if writing is interrupted.
-    with tempfile.NamedTemporaryFile(
-        dir=checkpoint_path.parent, prefix=f".{checkpoint_path.name}.", delete=False
-    ) as temporary:
-        temporary_path = Path(temporary.name)
-    try:
-        torch.save(payload, temporary_path)
-        os.replace(temporary_path, checkpoint_path)
-    finally:
-        temporary_path.unlink(missing_ok=True)
-    return checkpoint_path
+    manager = CheckpointManager(checkpoint_path.parent)
+    return manager.save_checkpoint(
+        model,
+        optimizer,
+        None,
+        str(checkpoint_path),
+        config=config,
+        train_history=train_history,
+        val_history=val_history,
+        extra=extra,
+    )
 
 
 # restore a saved model state on a target device
 def load_checkpoint(model: nn.Module, optimizer: Optional[torch.optim.Optimizer], checkpoint_path: str | Path, device: torch.device):
-    checkpoint_path = Path(checkpoint_path)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
-    payload = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(payload["model_state_dict"])
-    if optimizer is not None and "optimizer_state_dict" in payload:
-        optimizer.load_state_dict(payload["optimizer_state_dict"])
-    return payload
-
-
-def build_default_fashionmnist_config(
-    model_profile: str = "medium",
-    source_class: int = 7,
-    target_class: int = 9,
-    checkpoint_dir: str = "assets/fmnist_d2d_runs",
-    train_epochs: int = 100,
-    quick_run: bool = False,
-):
-    return ModelSpec(
-        dataset_name="fashionmnist",
-        model_profile=model_profile,
-        channels=1,
-        image_size=32,
-        num_classes=1,
-        class_dropout_prob=0.0,
-        lr=2e-4,
-        pairing_mode="random",
-        checkpoint_dir=checkpoint_dir,
-        train_epochs=train_epochs,
-        quick_run=quick_run,
+    manager = CheckpointManager(Path(checkpoint_path).parent)
+    return manager.load_checkpoint(
+        model,
+        str(checkpoint_path),
+        device=device,
+        load_optimizer=optimizer is not None,
+        optimizer=optimizer,
     )
 
 
@@ -423,7 +406,7 @@ def prepare_fashionmnist_setup(
     quick_run: bool = False,
     lr: float = 2e-4,
     validation_fraction: float = 0.1,
-    split_seed: int = 42,
+    seed: int = 42,
 ):
     spec = DatasetSpec(
         name="fashionmnist",
@@ -433,7 +416,7 @@ def prepare_fashionmnist_setup(
         source_class=source_class,
         target_class=target_class,
         validation_fraction=validation_fraction,
-        split_seed=split_seed,
+        seed=seed,
         class_names=DEFAULT_FASHIONMNIST_CLASS_NAMES.copy(),
         batch_size=batch_size,
         test_batch_size=test_batch_size,
@@ -472,22 +455,6 @@ def prepare_fashionmnist_setup(
     }
 
 
-def evaluate_on_loader(model_rf: DataToDataRF, loader: DataLoader, device: torch.device, max_batches: Optional[int] = None):
-    model_rf.model.eval()
-    total = 0.0
-    count = 0
-    with torch.no_grad():
-        for i, (x_a, x_b) in enumerate(loader):
-            if max_batches is not None and i >= max_batches:
-                break
-            x_a = x_a.to(device)
-            x_b = x_b.to(device)
-            loss = model_rf.forward(x_a, x_b)
-            total += loss.item()
-            count += 1
-    return total / max(1, count), count
-
-
 __all__ = [
     "DatasetSpec",
     "ModelSpec",
@@ -500,5 +467,4 @@ __all__ = [
     "save_checkpoint",
     "load_checkpoint",
     "prepare_fashionmnist_setup",
-    "evaluate_on_loader",
 ]
