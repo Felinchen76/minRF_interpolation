@@ -29,13 +29,18 @@ detailed path-quality analysis
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets
+
+from api.flow_model_api import build_transform
 
 
 # CLASSIFIER FOR SEMANTIC EVALUATION
@@ -85,6 +90,143 @@ class FashionMNISTEvalClassifier(nn.Module):
         features = features.view(features.size(0), -1)
         logits = self.classifier(features)
         return logits
+
+
+def train_eval_classifier(
+    data_root: str | Path,
+    epochs: int = 10,
+    batch_size: int = 256,
+    seed: int = 42,
+    validation_fraction: float = 0.1,
+    device: Optional[torch.device] = None,
+    save_path: Optional[str | Path] = None,
+) -> Tuple[FashionMNISTEvalClassifier, List[Dict[str, float]]]:
+    """Train the semantic evaluator using only the FashionMNIST training split."""
+    if epochs < 1:
+        raise ValueError("epochs must be at least 1")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    if seed < 0:
+        raise ValueError("seed must be non-negative")
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be between 0 and 1")
+
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    dataset = datasets.FashionMNIST(
+        root=str(data_root),
+        train=True,
+        download=True,
+        transform=build_transform(image_size=32),
+    )
+    indices_by_label = {label: [] for label in range(10)}
+    for index, label in enumerate(dataset.targets.tolist()):
+        indices_by_label[int(label)].append(index)
+
+    generator = torch.Generator().manual_seed(seed)
+    train_indices = []
+    validation_indices = []
+    for label_indices in indices_by_label.values():
+        order = torch.randperm(len(label_indices), generator=generator).tolist()
+        shuffled = [label_indices[index] for index in order]
+        validation_count = max(1, round(len(shuffled) * validation_fraction))
+        validation_indices.extend(shuffled[:validation_count])
+        train_indices.extend(shuffled[validation_count:])
+
+    train_loader = DataLoader(
+        Subset(dataset, train_indices),
+        batch_size=batch_size,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(seed + 1),
+    )
+    validation_loader = DataLoader(
+        Subset(dataset, validation_indices),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    model = FashionMNISTEvalClassifier(image_size=32, channels=1).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    history: List[Dict[str, float]] = []
+    best_accuracy = -1.0
+    best_state = None
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        train_count = 0
+        for images, labels in train_loader:
+            images, labels = images.to(device), labels.to(device)
+            optimizer.zero_grad()
+            loss = F.cross_entropy(model(images), labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * labels.size(0)
+            train_count += labels.size(0)
+
+        model.eval()
+        correct = 0
+        validation_count = 0
+        with torch.no_grad():
+            for images, labels in validation_loader:
+                images, labels = images.to(device), labels.to(device)
+                correct += (model(images).argmax(dim=1) == labels).sum().item()
+                validation_count += labels.size(0)
+
+        validation_accuracy = correct / validation_count
+        history.append({
+            "epoch": epoch + 1,
+            "train_loss": train_loss / train_count,
+            "validation_accuracy": validation_accuracy,
+        })
+        if validation_accuracy > best_accuracy:
+            best_accuracy = validation_accuracy
+            best_state = {
+                name: value.detach().cpu().clone()
+                for name, value in model.state_dict().items()
+            }
+
+    if best_state is None:
+        raise RuntimeError("Evaluator training did not produce a validation checkpoint")
+    model.load_state_dict(best_state)
+    model.to(device).eval()
+
+    if save_path is not None:
+        checkpoint_path = Path(save_path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "model_state_dict": best_state,
+            "history": history,
+            "config": {
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "seed": seed,
+                "validation_fraction": validation_fraction,
+                "best_validation_accuracy": best_accuracy,
+                "image_size": 32,
+                "channels": 1,
+            },
+        }, checkpoint_path)
+
+    return model, history
+
+
+def load_eval_classifier(
+    checkpoint_path: str | Path,
+    device: Optional[torch.device] = None,
+) -> FashionMNISTEvalClassifier:
+    """Load a saved evaluator checkpoint and return the classifier in eval mode."""
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    payload = torch.load(checkpoint_path, map_location=device)
+    state_dict = payload.get("model_state_dict", payload)
+    model = FashionMNISTEvalClassifier(image_size=32, channels=1).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
 
 
 # BASELINE TRAJECTORY GENERATORS
@@ -259,6 +401,7 @@ def classifier_logits(eval_model: nn.Module, x: torch.Tensor) -> torch.Tensor:
     Returns:
         [batch, 10] logits
     """
+    eval_model.eval()
     return eval_model(x)
 
 
@@ -309,6 +452,9 @@ class TrajectoryMetrics:
     
     # endpoint metrics (for comparison)
     endpoint_target_confidence: float
+
+    # Per-sample values support paired comparisons and confidence intervals.
+    sample_metrics: List[Dict[str, object]] = field(default_factory=list)
     
     def to_dict(self) -> Dict:
         """Convert to dictionary for logging/saving"""
@@ -322,6 +468,7 @@ class TrajectoryMetrics:
             "source_confidence_drop": self.source_confidence_drop,
             "prob_gradient": self.prob_gradient,
             "endpoint_target_confidence": self.endpoint_target_confidence,
+            "sample_metrics": self.sample_metrics,
         }
 
 
@@ -355,6 +502,10 @@ def evaluate_trajectory_metrics(
     """
     if len(trajectory) < 2:
         raise ValueError("trajectory must contain at least two points")
+    if not 0 <= target_label < 10:
+        raise ValueError("target_label must be between 0 and 9")
+    if source_label is not None and not 0 <= source_label < 10:
+        raise ValueError("source_label must be between 0 and 9")
     if device is None:
         device = trajectory[0].device
     
@@ -401,6 +552,43 @@ def evaluate_trajectory_metrics(
     prob_gradient = (
         (probs[1:] - probs[:-1]).norm(p=2, dim=2).mean(dim=1).cpu().numpy().tolist()
     )
+
+    per_sample_target = probs[:, :, target_label]
+    per_sample_entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=2)
+    per_sample_max_confidence = probs.max(dim=2).values
+    per_sample_prob_gradient = (
+        (probs[1:] - probs[:-1]).norm(p=2, dim=2)
+    )
+    per_sample_source = (
+        probs[:, :, source_label] if source_label is not None else None
+    )
+    sample_metrics = []
+    for index in range(probs.size(1)):
+        target_curve = per_sample_target[:, index]
+        target_diffs = target_curve[1:] - target_curve[:-1]
+        sample_metrics.append({
+            "target_confidence": target_curve.cpu().tolist(),
+            "target_confidence_monotonic": bool((target_diffs >= -0.01).all().item()),
+            "target_confidence_mean_change": float(target_diffs.mean().item()),
+            "entropy_curve": per_sample_entropy[:, index].cpu().tolist(),
+            "max_class_confidence": per_sample_max_confidence[:, index].cpu().tolist(),
+            "source_confidence": (
+                per_sample_source[:, index].cpu().tolist()
+                if per_sample_source is not None
+                else []
+            ),
+            "source_confidence_drop": (
+                float(max(
+                    0.0,
+                    per_sample_source[0, index].item()
+                    - per_sample_source[-1, index].item(),
+                ))
+                if per_sample_source is not None
+                else 0.0
+            ),
+            "prob_gradient": per_sample_prob_gradient[:, index].cpu().tolist(),
+            "endpoint_target_confidence": float(target_curve[-1].item()),
+        })
     
     # ========== ENDPOINT ==========
     endpoint_target_confidence = float(target_confidence[-1])
@@ -415,13 +603,14 @@ def evaluate_trajectory_metrics(
         source_confidence_drop=source_confidence_drop,
         prob_gradient=prob_gradient,
         endpoint_target_confidence=endpoint_target_confidence,
+        sample_metrics=sample_metrics,
     )
 
 
 # PIXEL-SPACE SMOOTHNESS METRICS
 
 @torch.no_grad()
-def trajectory_pixel_smoothness(trajectory: List[torch.Tensor]) -> Dict[str, float]:
+def trajectory_pixel_smoothness(trajectory: List[torch.Tensor]) -> Dict[str, object]:
     """
     Evaluate pixel-space smoothness of a trajectory
     
@@ -436,19 +625,21 @@ def trajectory_pixel_smoothness(trajectory: List[torch.Tensor]) -> Dict[str, flo
         trajectory: List of [batch, channels, height, width]
     
     Returns:
-        Dict with smoothness metrics
+        Dict with aggregate and per-sample smoothness metrics
     """
     if len(trajectory) < 2:
         raise ValueError("trajectory must contain at least two points")
     step_sizes = []
+    per_sample_step_sizes = []
     
     for i in range(1, len(trajectory)):
         x_prev = trajectory[i-1]
         x_curr = trajectory[i]
         
         # L2 distance in pixel space
-        delta = (x_curr - x_prev).flatten(start_dim=1).norm(p=2, dim=1).mean().item()
-        step_sizes.append(delta)
+        sample_delta = (x_curr - x_prev).flatten(start_dim=1).norm(p=2, dim=1)
+        step_sizes.append(sample_delta.mean().item())
+        per_sample_step_sizes.append(sample_delta.cpu().tolist())
     
     step_sizes = np.array(step_sizes)
     
@@ -457,6 +648,7 @@ def trajectory_pixel_smoothness(trajectory: List[torch.Tensor]) -> Dict[str, flo
         "max_step_size": float(np.max(step_sizes)),
         "step_size_std": float(np.std(step_sizes)),
         "step_sizes": step_sizes.tolist(),
+        "per_sample_step_sizes": per_sample_step_sizes,
     }
 
 
