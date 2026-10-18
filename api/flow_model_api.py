@@ -13,7 +13,9 @@ stay lightweight enough for notebooks and quick experiments
 """
 
 import json
+import os
 import random
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -314,7 +316,16 @@ def save_checkpoint(
         "val_history": val_history or [],
         "extra": extra or {},
     }
-    torch.save(payload, checkpoint_path)
+    # Keep the previous snapshot intact if writing is interrupted.
+    with tempfile.NamedTemporaryFile(
+        dir=checkpoint_path.parent, prefix=f".{checkpoint_path.name}.", delete=False
+    ) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, checkpoint_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return checkpoint_path
 
 
@@ -366,6 +377,7 @@ def prepare_fashionmnist_setup(
     checkpoint_dir: str = "assets/fmnist_d2d_runs",
     train_epochs: int = 100,
     quick_run: bool = False,
+    lr: float = 2e-4,
 ):
     spec = DatasetSpec(
         name="fashionmnist",
@@ -386,7 +398,7 @@ def prepare_fashionmnist_setup(
         image_size=32,
         num_classes=1,
         class_dropout_prob=0.0,
-        lr=2e-4,
+        lr=lr,
         pairing_mode="random",
         checkpoint_dir=checkpoint_dir,
         train_epochs=train_epochs,
