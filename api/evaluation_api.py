@@ -10,11 +10,11 @@ of interpolation trajectories. It implements:
    - Linear Pixel: direct pixel interpolation (oracle-style)
    - NN-matched Linear: linear interpolation to nearest neighbor (oracle-style)
 
-2. Semantic evaluation criteria (as per research framework):
-   - Plausibility: proximity to real data distribution
+2. Classifier-based semantic criteria:
+   - Classifier-confidence proxy (not a data-distribution plausibility score)
    - Semantic Progression: how consistently semantic properties change
    - Target Alignment & Consistency: movement toward target
-   - Preservation: stability of non-target properties
+   - Source-class confidence change
    - Smoothness: local continuity along trajectory
 
 3. Quantitative metrics computed along trajectories as functions of time t
@@ -89,6 +89,11 @@ class FashionMNISTEvalClassifier(nn.Module):
 
 # BASELINE TRAJECTORY GENERATORS
 
+def _validate_steps(steps: int) -> None:
+    if steps < 1:
+        raise ValueError("steps must be at least 1")
+
+
 @torch.no_grad()
 def identity_trajectory(x_source: torch.Tensor, steps: int) -> List[torch.Tensor]:
     """
@@ -104,6 +109,7 @@ def identity_trajectory(x_source: torch.Tensor, steps: int) -> List[torch.Tensor
     Returns:
         List of (steps+1) tensors, each [batch, channels, height, width]
     """
+    _validate_steps(steps)
     trajectory = []
     for _ in range(steps + 1):
         trajectory.append(x_source.clone())
@@ -136,6 +142,7 @@ def global_shift_trajectory(
     Returns:
         List of (steps+1) tensors
     """
+    _validate_steps(steps)
     trajectory = []
     diff = target_mean - source_mean
     
@@ -171,6 +178,7 @@ def linear_interpolation(
     Returns:
         List of (steps+1) tensors
     """
+    _validate_steps(steps)
     trajectory = []
     
     for t in range(steps + 1):
@@ -211,6 +219,7 @@ def nn_matched_linear_trajectory(
     Returns:
         (trajectory: List of tensors, nearest_neighbor: selected target image)
     """
+    _validate_steps(steps)
     # flatten for distance computation
     x_source_flat = x_source.view(x_source.size(0), -1)
     target_flat = target_class_dataset.view(target_class_dataset.size(0), -1)
@@ -288,12 +297,12 @@ class TrajectoryMetrics:
     # semantic progression: class probability entropy (diversity)
     entropy_curve: List[float]  # entropy H(p(x_t)) for each t
     
-    # plausibility: confidence in ANY class (not source/target specific)
+    # classifier-confidence proxy; not a distributional plausibility guarantee
     max_class_confidence: List[float]  # max_k P(k | x_t)
     
-    # preservation: how much does source-class confidence drop?
+    # source-class confidence and its non-negative endpoint drop
     source_confidence: List[float]  # P(source_class | x_t)
-    source_confidence_preservation: float  # (source_conf at t=0 - t=1) normalized
+    source_confidence_drop: float  # non-negative drop from initial to final confidence
     
     # smoothness: local changes in class probabilities
     prob_gradient: List[float]  # ||p(x_t) - p(x_{t-1})||_2
@@ -310,7 +319,7 @@ class TrajectoryMetrics:
             "entropy_curve": self.entropy_curve,
             "max_class_confidence": self.max_class_confidence,
             "source_confidence": self.source_confidence,
-            "source_confidence_preservation": self.source_confidence_preservation,
+            "source_confidence_drop": self.source_confidence_drop,
             "prob_gradient": self.prob_gradient,
             "endpoint_target_confidence": self.endpoint_target_confidence,
         }
@@ -330,8 +339,8 @@ def evaluate_trajectory_metrics(
     Implements quantitative versions of:
     - Semantic Progression: via entropy and target-class confidence changes
     - Target Alignment & Consistency: monotonicity of target confidence
-    - Preservation: source-class confidence retention
-    - Plausibility: max confidence in any class
+    - Source-class confidence drop between trajectory endpoints
+    - Classifier-confidence proxy (not a data-distribution or OOD score)
     - Smoothness: probability gradient between steps
     
     Args:
@@ -344,6 +353,8 @@ def evaluate_trajectory_metrics(
     Returns:
         TrajectoryMetrics dataclass with curves and scalar summaries
     """
+    if len(trajectory) < 2:
+        raise ValueError("trajectory must contain at least two points")
     if device is None:
         device = trajectory[0].device
     
@@ -355,47 +366,41 @@ def evaluate_trajectory_metrics(
     
     # stack into [steps, batch, 10]
     probs = torch.stack(probs_list, dim=0)  # [steps, batch, 10]
-    
-    # extract batch=0 (first sample, assuming batch evaluation)
-    probs_batch = probs[:, 0, :]  # [steps, 10]
+    mean_probs = probs.mean(dim=1)
     
     # ========== SEMANTIC PROGRESSION ==========
     # target-class confidence curve
-    target_confidence = probs_batch[:, target_label].cpu().numpy().tolist()
+    target_confidence = mean_probs[:, target_label].cpu().numpy().tolist()
     
     # entropy curve (diversity of predictions)
-    entropy_curve = []
-    for p in probs_batch:
-        h = float((-p * torch.log(p + 1e-8)).sum().item())
-        entropy_curve.append(h)
+    entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=2).mean(dim=1)
+    entropy_curve = entropy.cpu().numpy().tolist()
     
     # ========== target alignment & consistency ==========
     # check monotonicity: does target confidence increase consistently?
-    target_conf_tensor = probs_batch[:, target_label]
+    target_conf_tensor = mean_probs[:, target_label]
     diffs = target_conf_tensor[1:] - target_conf_tensor[:-1]
     target_confidence_monotonic = bool((diffs >= -0.01).all().item())  # allow small jitter
     target_confidence_mean_change = float(diffs.mean().item())
     
-    # ========== plausibility ==========
-    # highest confidence in ANY class (should be reasonable throughout)
-    max_class_confidence = probs_batch.max(dim=1)[0].cpu().numpy().tolist()
+    # ========== classifier-confidence proxy ==========
+    max_class_confidence = probs.max(dim=2).values.mean(dim=1).cpu().numpy().tolist()
     
     # ========== PRESERVATION ==========
     source_confidence = []
-    source_confidence_preservation = 0.0
+    source_confidence_drop = 0.0
     if source_label is not None:
-        source_confidence = probs_batch[:, source_label].cpu().numpy().tolist()
-        # preservation: how much did source-class prob drop?
+        source_confidence = mean_probs[:, source_label].cpu().numpy().tolist()
+        # Measure the non-negative drop in source-class confidence.
         initial_source_conf = source_confidence[0]
         final_source_conf = source_confidence[-1]
-        source_confidence_preservation = float(max(0, initial_source_conf - final_source_conf))
+        source_confidence_drop = float(max(0, initial_source_conf - final_source_conf))
     
     # ========== SMOOTHNESS ==========
     # L2 distance in probability space between consecutive steps
-    prob_gradient = []
-    for i in range(1, len(probs_batch)):
-        delta = torch.norm(probs_batch[i] - probs_batch[i-1], p=2).item()
-        prob_gradient.append(delta)
+    prob_gradient = (
+        (probs[1:] - probs[:-1]).norm(p=2, dim=2).mean(dim=1).cpu().numpy().tolist()
+    )
     
     # ========== ENDPOINT ==========
     endpoint_target_confidence = float(target_confidence[-1])
@@ -407,7 +412,7 @@ def evaluate_trajectory_metrics(
         entropy_curve=entropy_curve,
         max_class_confidence=max_class_confidence,
         source_confidence=source_confidence if source_label is not None else [],
-        source_confidence_preservation=source_confidence_preservation,
+        source_confidence_drop=source_confidence_drop,
         prob_gradient=prob_gradient,
         endpoint_target_confidence=endpoint_target_confidence,
     )
@@ -433,6 +438,8 @@ def trajectory_pixel_smoothness(trajectory: List[torch.Tensor]) -> Dict[str, flo
     Returns:
         Dict with smoothness metrics
     """
+    if len(trajectory) < 2:
+        raise ValueError("trajectory must contain at least two points")
     step_sizes = []
     
     for i in range(1, len(trajectory)):
@@ -440,7 +447,7 @@ def trajectory_pixel_smoothness(trajectory: List[torch.Tensor]) -> Dict[str, flo
         x_curr = trajectory[i]
         
         # L2 distance in pixel space
-        delta = torch.norm(x_curr - x_prev, p=2).item()
+        delta = (x_curr - x_prev).flatten(start_dim=1).norm(p=2, dim=1).mean().item()
         step_sizes.append(delta)
     
     step_sizes = np.array(step_sizes)
@@ -476,7 +483,7 @@ def intraclass_robustness_test(
     (not just successful for one lucky pair).
     
     Args:
-        flow_model: trained flow model with .forward_trajectory() method
+        flow_model: trained flow model with a .sample() method
         eval_model: FashionMNISTEvalClassifier
         test_dataset: full FashionMNIST test set
         test_label_index: Dict[int, List[int]] mapping class -> image indices
@@ -493,12 +500,14 @@ def intraclass_robustness_test(
             ...
         }
     """
+    if n_pairs < 1:
+        raise ValueError("n_pairs must be at least 1")
+    _validate_steps(steps)
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     results = {
         'identity': [],
-        'global_shift': [],
         'linear_oracle': [],
         'flow': [],
     }
@@ -518,9 +527,7 @@ def intraclass_robustness_test(
         traj_identity = identity_trajectory(x_source, steps)
         traj_linear = linear_interpolation(x_source, x_target, steps)
         
-        # generate flow trajectory (depends on model interface)
-        # assuming flow_model has a method that generates trajectories
-        traj_flow = flow_model.forward_trajectory(x_source, steps=steps)
+        traj_flow = flow_model.sample(x_source, steps=steps)
         
         # evaluate each
         for name, traj in [
@@ -591,7 +598,7 @@ def summarize_comparison(comparison_results: Dict[str, TrajectoryMetrics]) -> Di
             'endpoint_target_conf': metrics.endpoint_target_confidence,
             'target_conf_monotonic': metrics.target_confidence_monotonic,
             'target_conf_mean_change': metrics.target_confidence_mean_change,
-            'source_preservation': metrics.source_confidence_preservation,
+            'source_confidence_drop': metrics.source_confidence_drop,
             'mean_entropy': np.mean(metrics.entropy_curve) if metrics.entropy_curve else 0.0,
             'mean_max_class_conf': np.mean(metrics.max_class_confidence),
             'mean_prob_gradient': np.mean(metrics.prob_gradient) if metrics.prob_gradient else 0.0,
