@@ -19,11 +19,10 @@ from typing import Dict, Optional
 
 import torch
 
+from api.checkpoint_management import CheckpointManager
 from api.flow_model_api import (
     DataToDataRF,
-    load_checkpoint,
     prepare_fashionmnist_setup,
-    save_checkpoint,
 )
 
 
@@ -63,11 +62,10 @@ class TrainingSpec:
 
 # small helper for predictable checkpoint paths
 def checkpoint_paths(checkpoint_dir: str | Path, model_name: str = "fmnist_d2d") -> Dict[str, Path]:
-    run_dir = Path(checkpoint_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
+    manager = CheckpointManager(checkpoint_dir)
     return {
-        "latest": run_dir / f"{model_name}_checkpoint_latest.pt",
-        "best": run_dir / f"{model_name}_checkpoint_best.pt",
+        "latest": manager.get_checkpoint_path(model_name, "latest"),
+        "best": manager.get_checkpoint_path(model_name, "best"),
     }
 
 
@@ -141,6 +139,7 @@ def train_data_to_data_flow(
     validation_loader = setup["validation_loader"]
     test_loader = setup["test_loader"]
 
+    checkpoint_manager = CheckpointManager(spec.checkpoint_dir)
     run_paths = checkpoint_paths(spec.checkpoint_dir, spec.model_name)
     latest_path = run_paths["latest"]
     best_path = run_paths["best"]
@@ -162,7 +161,9 @@ def train_data_to_data_flow(
                   pairing_mode="random", conditioning="none")
 
     if spec.resume_from is not None:
-        payload = load_checkpoint(model, optimizer, spec.resume_from, device)
+        payload = checkpoint_manager.load_checkpoint(
+            model, spec.resume_from, device=device, load_optimizer=True, optimizer=optimizer
+        )
         state = payload.get("extra", {})
         required = {"epoch", "best_val_loss", "best_epoch", "epochs_no_improve", "scaler"}
         if not required.issubset(state) or "optimizer_state_dict" not in payload:
@@ -197,7 +198,10 @@ def train_data_to_data_flow(
 
     if (spec.resume_from is None and not spec.force_retrain
             and spec.load_best_if_available and best_path.exists()):
-        payload = load_checkpoint(model, optimizer, best_path, device)
+        payload = checkpoint_manager.load_checkpoint(
+            model, spec.model_name, checkpoint_type="best", device=device,
+            load_optimizer=True, optimizer=optimizer,
+        )
         train_loss_history = payload.get("train_history", [])
         val_loss_history = payload.get("val_history", [])
         loss_history = payload.get("train_history", [])
@@ -277,20 +281,25 @@ def train_data_to_data_flow(
                 "scaler": scaler.state_dict(),
             }
             save_start = perf_counter()
-            save_checkpoint(
-                model, optimizer, latest_path, config, train_loss_history, val_loss_history, state
+            checkpoint_manager.save_checkpoint(
+                model, optimizer, None, spec.model_name,
+                checkpoint_type="latest", config=config,
+                train_history=train_loss_history, val_history=val_loss_history,
+                extra=state, device_used=str(device),
             )
             if improvement > spec.min_delta:
-                save_checkpoint(
-                    model, optimizer, best_path, config, train_loss_history, val_loss_history, state
+                checkpoint_manager.save_checkpoint(
+                    model, optimizer, None, spec.model_name,
+                    checkpoint_type="best", config=config,
+                    train_history=train_loss_history, val_history=val_loss_history,
+                    extra=state, device_used=str(device),
                 )
             if (epoch + 1) % spec.checkpoint_every == 0:
-                periodic_path = latest_path.parent / (
-                    f"{spec.model_name}_checkpoint_epoch_{epoch + 1:04d}.pt"
-                )
-                save_checkpoint(
-                    model, optimizer, periodic_path, config,
-                    train_loss_history, val_loss_history, state,
+                periodic_path = checkpoint_manager.save_checkpoint(
+                    model, optimizer, None, spec.model_name,
+                    config=config, train_history=train_loss_history,
+                    val_history=val_loss_history, extra=state,
+                    epoch=epoch + 1, device_used=str(device),
                 )
                 periodic_paths.append(periodic_path)
                 print(f"saved periodic checkpoint: {periodic_path}")

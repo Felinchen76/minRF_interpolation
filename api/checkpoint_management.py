@@ -17,8 +17,9 @@ Goals:
 from __future__ import annotations
 
 import json
-from pdb import run
+import os
 import shutil
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -115,52 +116,112 @@ class CheckpointManager:
         Returns:
             Path to checkpoint file
         """
-        suffix = 'checkpoint_best' if checkpoint_type == 'best' else 'checkpoint_latest'
+        if checkpoint_type not in {'best', 'latest'}:
+            raise ValueError("checkpoint_type must be 'best' or 'latest'")
+        suffix = f'checkpoint_{checkpoint_type}'
         return self.checkpoint_dir / f"{run_name}_{suffix}.pt"
-    
+
+    def get_periodic_checkpoint_path(self, run_name: str, epoch: int) -> Path:
+        """Get the path for a numbered training snapshot."""
+        if epoch < 1:
+            raise ValueError("epoch must be at least 1")
+        return self.checkpoint_dir / f"{run_name}_checkpoint_epoch_{epoch:04d}.pt"
+
     def get_metadata_path(self, run_name: str) -> Path:
         """Get path to metadata file"""
         return self.checkpoint_dir / f"{run_name}_metadata.json"
-    
+
     def save_checkpoint(
         self,
         model: torch.nn.Module,
         optimizer: Optional[torch.optim.Optimizer],
-        metadata: CheckpointMetadata,
+        metadata: Optional[CheckpointMetadata],
         run_name: str,
-        checkpoint_type: str = 'best'
+        checkpoint_type: str = 'best',
+        *,
+        config: Optional[Dict[str, Any]] = None,
+        train_history: Optional[list[float]] = None,
+        val_history: Optional[list[float]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+        epoch: Optional[int] = None,
+        device_used: str = 'unknown',
     ) -> Path:
         """
-        Save checkpoint with metadata
+        Save a model checkpoint and, when supplied, complete training state.
         
         Args:
             model: model to save
             optimizer: optimizer state (optional)
-            metadata: checkpoint metadata
+            metadata: checkpoint metadata; derived from config and extra for training snapshots
             run_name: name of run
             checkpoint_type: 'best' or 'latest'
+            config: training configuration for resumable checkpoints
+            train_history: per-epoch training losses
+            val_history: per-epoch validation losses
+            extra: training progress and scaler state
+            epoch: save a numbered snapshot at this epoch instead of best/latest
+            device_used: device used for training, included in derived metadata
         
         Returns:
             Path to saved checkpoint
         """
-        checkpoint_path = self.get_checkpoint_path(run_name, checkpoint_type)
+        checkpoint_path = (
+            self.get_periodic_checkpoint_path(run_name, epoch)
+            if epoch is not None
+            else self.get_checkpoint_path(run_name, checkpoint_type)
+        )
         metadata_path = self.get_metadata_path(run_name)
-        
-        # save checkpoint
+
+        train_history = train_history or []
+        val_history = val_history or []
+        extra = extra or {}
+        if metadata is None:
+            if config is None or not extra or not train_history:
+                raise ValueError(
+                    "metadata is required unless config, training histories, and extra state are provided"
+                )
+            metadata = CheckpointMetadata(
+                model_profile=str(config["model_profile"]),
+                source_class=int(config["source_class"]),
+                target_class=int(config["target_class"]),
+                batch_size=int(config["batch_size"]),
+                learning_rate=float(config["lr"]),
+                train_epochs=int(config["train_epochs"]),
+                early_stopping_patience=int(config["patience"]),
+                epochs_completed=int(extra["epoch"]),
+                best_validation_loss=float(extra["best_val_loss"]),
+                final_training_loss=float(train_history[-1]),
+                created_at=datetime.now().isoformat(timespec="seconds"),
+                device_used=device_used,
+            )
+
         checkpoint_data = {
             'model_state_dict': model.state_dict(),
             'metadata': metadata.to_dict(),
         }
-        
         if optimizer is not None:
             checkpoint_data['optimizer_state_dict'] = optimizer.state_dict()
-        
-        torch.save(checkpoint_data, checkpoint_path)
-        
-        # save metadata separately for easy access
+        if config is not None:
+            checkpoint_data.update(
+                config=config,
+                train_history=train_history,
+                val_history=val_history,
+                extra=extra,
+            )
+
+        with tempfile.NamedTemporaryFile(
+            dir=checkpoint_path.parent,
+            prefix=f".{checkpoint_path.name}.",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+        try:
+            torch.save(checkpoint_data, temporary_path)
+            os.replace(temporary_path, checkpoint_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
         metadata.save(metadata_path)
-        
-        print(f"  Checkpoint saved: {checkpoint_path}")
         return checkpoint_path
     
     def load_checkpoint(
@@ -177,48 +238,59 @@ class CheckpointManager:
         
         Args:
             model: model to load state into
-            run_name: name of run
+            run_name: run name, or a direct path to a checkpoint file
             checkpoint_type: 'best' or 'latest'
             device: device to load to ('cuda', 'cpu', etc.)
             load_optimizer: whether to load optimizer state
             optimizer: optimizer to load state into (required if load_optimizer=True)
         
         Returns:
-            Dict with:
-            - 'model': loaded model
-            - 'metadata': checkpoint metadata
-            - 'optimizer' (if load_optimizer=True)
+            Checkpoint payload plus the loaded 'model' and 'metadata' entries.
+            Training checkpoints also include config, histories, and resume state.
+            Metadata is None only for older checkpoints without embedded or sidecar metadata.
         """
-        checkpoint_path = self.get_checkpoint_path(run_name, checkpoint_type)
-        metadata_path = self.get_metadata_path(run_name)
-        
-        if not checkpoint_path.exists():
+        candidate_path = Path(run_name)
+        checkpoint_path = (
+            candidate_path
+            if candidate_path.is_file()
+            else self.get_checkpoint_path(run_name, checkpoint_type)
+        )
+        if candidate_path.is_file():
+            run_stem = candidate_path.stem
+            for suffix in ("_checkpoint_best", "_checkpoint_latest"):
+                if run_stem.endswith(suffix):
+                    run_stem = run_stem.removesuffix(suffix)
+                    break
+            else:
+                run_stem = run_stem.rsplit("_checkpoint_epoch_", 1)[0]
+            metadata_path = self.get_metadata_path(run_stem)
+        else:
+            metadata_path = self.get_metadata_path(run_name)
+        if not checkpoint_path.is_file():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        
-        # load checkpoint
+
         checkpoint = torch.load(checkpoint_path, map_location=device or 'cpu')
         model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # load metadata
-        metadata = CheckpointMetadata.load(metadata_path)
-        
+        metadata_data = checkpoint.get('metadata')
+        if metadata_data is not None:
+            metadata = CheckpointMetadata.from_dict(metadata_data)
+        elif metadata_path.is_file():
+            metadata = CheckpointMetadata.load(metadata_path)
+        else:
+            metadata = None
+
         result = {
+            **checkpoint,
             'model': model,
             'metadata': metadata,
         }
-        
-        # load optimizer if requested
         if load_optimizer:
             if optimizer is None:
                 raise ValueError("optimizer required when load_optimizer=True")
-            if 'optimizer_state_dict' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'optimizer_state_dict' not in checkpoint:
+                raise ValueError(f"Checkpoint has no optimizer state: {checkpoint_path}")
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             result['optimizer'] = optimizer
-        
-        print(f"  Checkpoint loaded: {checkpoint_path}")
-        print(f"  Epochs completed: {metadata.epochs_completed}")
-        print(f"  Best validation loss: {metadata.best_validation_loss:.6f}")
-        
         return result
     
     def load_metadata(self, run_name: str) -> CheckpointMetadata:
