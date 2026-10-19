@@ -86,10 +86,14 @@ class FashionMNISTEvalClassifier(nn.Module):
         """
         Forward pass: x -> [batch, 10] logits.
         """
-        features = self.features(x)
-        features = features.view(features.size(0), -1)
+        features = self.extract_features(x)
         logits = self.classifier(features)
         return logits
+
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the flattened penultimate convolutional representation."""
+        features = self.features(x)
+        return features.flatten(start_dim=1)
 
 
 def train_eval_classifier(
@@ -419,6 +423,101 @@ def classifier_probs(eval_model: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """
     logits = classifier_logits(eval_model, x)
     return F.softmax(logits, dim=1)
+
+
+@torch.no_grad()
+def extract_evaluator_features(
+    eval_model: nn.Module,
+    images: torch.Tensor,
+    batch_size: int = 512,
+) -> torch.Tensor:
+    """Extract L2-normalized evaluator embeddings in bounded batches."""
+    if images.ndim < 2 or images.size(0) == 0:
+        raise ValueError("images must contain a non-empty batch")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    feature_extractor = getattr(eval_model, "extract_features", None)
+    if not callable(feature_extractor):
+        raise TypeError("eval_model must provide an extract_features method")
+
+    eval_model.eval()
+    features = []
+    for start in range(0, images.size(0), batch_size):
+        batch_features = feature_extractor(images[start:start + batch_size])
+        if batch_features.ndim != 2 or batch_features.size(0) != min(
+            batch_size, images.size(0) - start
+        ):
+            raise ValueError("extract_features must return a [batch, features] tensor")
+        features.append(F.normalize(batch_features, p=2, dim=1))
+    return torch.cat(features, dim=0)
+
+
+@torch.no_grad()
+def evaluate_feature_trajectory_metrics(
+    trajectory: List[torch.Tensor],
+    eval_model: nn.Module,
+    target_reference_features: torch.Tensor,
+    source_reference_features: torch.Tensor,
+    batch_size: int = 512,
+) -> Dict[str, object]:
+    """Measure target alignment, pair-manifold support, preservation, and smoothness.
+
+    All distances are cosine distances between L2-normalized frozen-evaluator
+    embeddings. Reference features must come only from the training split.
+    """
+    if len(trajectory) < 2:
+        raise ValueError("trajectory must contain at least two points")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    if target_reference_features.ndim != 2 or target_reference_features.size(0) == 0:
+        raise ValueError("target_reference_features must be a non-empty 2D tensor")
+    if source_reference_features.ndim != 2 or source_reference_features.size(0) == 0:
+        raise ValueError("source_reference_features must be a non-empty 2D tensor")
+    if target_reference_features.size(1) != source_reference_features.size(1):
+        raise ValueError("Source and target reference feature dimensions must match")
+
+    batch_count = trajectory[0].size(0)
+    if any(state.size(0) != batch_count for state in trajectory):
+        raise ValueError("All trajectory states must have the same batch size")
+    images = torch.cat(trajectory, dim=0)
+    features = extract_evaluator_features(eval_model, images, batch_size=batch_size)
+    if features.size(1) != target_reference_features.size(1):
+        raise ValueError("Reference features must match evaluator feature dimensions")
+    feature_curve = features.view(len(trajectory), batch_count, -1)
+
+    target_bank = F.normalize(target_reference_features.to(features.device), p=2, dim=1)
+    source_bank = F.normalize(source_reference_features.to(features.device), p=2, dim=1)
+    pair_bank = torch.cat((source_bank, target_bank), dim=0)
+    flat_features = feature_curve.flatten(start_dim=0, end_dim=1)
+
+    def nearest_cosine_distance(reference_bank: torch.Tensor) -> torch.Tensor:
+        nearest_similarities = []
+        for start in range(0, flat_features.size(0), batch_size):
+            similarities = flat_features[start:start + batch_size] @ reference_bank.T
+            nearest_similarities.append(similarities.max(dim=1).values)
+        return 1.0 - torch.cat(nearest_similarities).view(len(trajectory), batch_count)
+
+    target_distance = nearest_cosine_distance(target_bank)
+    pair_reference_distance = nearest_cosine_distance(pair_bank)
+    source_similarity = (feature_curve * feature_curve[0:1]).sum(dim=2)
+    feature_step_distance = 1.0 - (feature_curve[1:] * feature_curve[:-1]).sum(dim=2)
+
+    sample_metrics = []
+    for index in range(batch_count):
+        sample_metrics.append({
+            "target_reference_distance": target_distance[:, index].cpu().tolist(),
+            "source_feature_similarity": source_similarity[:, index].cpu().tolist(),
+            "pair_reference_distance": pair_reference_distance[:, index].cpu().tolist(),
+            "feature_step_distance": feature_step_distance[:, index].cpu().tolist(),
+        })
+
+    return {
+        "target_reference_distance": target_distance.mean(dim=1).cpu().tolist(),
+        "source_feature_similarity": source_similarity.mean(dim=1).cpu().tolist(),
+        "pair_reference_distance": pair_reference_distance.mean(dim=1).cpu().tolist(),
+        "feature_step_distance": feature_step_distance.mean(dim=1).cpu().tolist(),
+        "sample_metrics": sample_metrics,
+    }
 
 
 @dataclass

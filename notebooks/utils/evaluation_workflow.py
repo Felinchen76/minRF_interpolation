@@ -9,7 +9,9 @@ import torch
 
 from api.checkpoint_management import CheckpointManager
 from api.evaluation_api import (
+    evaluate_feature_trajectory_metrics,
     evaluate_trajectory_metrics,
+    extract_evaluator_features,
     global_shift_trajectory,
     identity_trajectory,
     linear_interpolation,
@@ -152,6 +154,8 @@ def evaluate_class_pair_cohort(
     ]).to(device)
     source_bank = reference_banks[source_label].to(device)
     target_bank = reference_banks[target_label].to(device)
+    source_reference_features = extract_evaluator_features(eval_model, source_bank)
+    target_reference_features = extract_evaluator_features(eval_model, target_bank)
     source_mean = source_bank.mean(dim=0, keepdim=True)
     target_mean = target_bank.mean(dim=0, keepdim=True)
 
@@ -176,8 +180,15 @@ def evaluate_class_pair_cohort(
             source_label=source_label,
             device=device,
         )
+        feature_metrics = evaluate_feature_trajectory_metrics(
+            trajectory,
+            eval_model,
+            target_reference_features=target_reference_features,
+            source_reference_features=source_reference_features,
+        )
         method_results[method] = {
             "metrics": metrics.to_dict(),
+            "feature_metrics": feature_metrics,
             "pixel_smoothness": trajectory_pixel_smoothness(trajectory),
         }
 
