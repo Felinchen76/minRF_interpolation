@@ -1,0 +1,15 @@
+{
+  "model_profile": "medium",
+  "source_class": 7,
+  "target_class": 9,
+  "batch_size": 128,
+  "learning_rate": 0.0002,
+  "train_epochs": 100,
+  "early_stopping_patience": 10,
+  "epochs_completed": 54,
+  "best_validation_loss": 0.04348675563931465,
+  "final_training_loss": 0.04393359646201134,
+  "created_at": "2026-10-18T14:17:00",
+  "device_used": "cuda",
+  "comment": null
+}
